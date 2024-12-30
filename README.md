@@ -32,3 +32,6 @@ for OBDLink CX (and a lot of other OBD adaptors from China) there will be the fo
     BLEUUID  rxUUID("FFF1");//Notify characteristic
     BLEUUID  txUUID("FFF2");//Write characteristic
 
+Some references regarding chars and services of OBD dongles:
+https://stackoverflow.com/questions/61090365/what-ble-characteristic-should-i-use-in-a-ble-ios-device-for-obdii
+https://stackoverflow.com/questions/52075456/which-gatt-profile-and-services-are-used-by-obd-ble-adapters-like-lelink-automa
