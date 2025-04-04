@@ -1,252 +1,363 @@
 #include "BLEClientSerial.h"
 
-static boolean doConnect = false;
-static boolean connected = false;
-static boolean doScan = false;
-static std::string staticBuffer = "";
+static BLEScanResultsSet scanResults;
 
-std::string targetDeviceName = "OBDLink CX"; // Target BLE device
-BLEUUID serviceUUID_FFF0("FFF0"); 
-BLEUUID rxUUID("FFF1");
-BLEUUID txUUID("FFF2");
-
-static BLEAdvertisedDevice *myDevice;
-
-static void printFriendlyResponse(uint8_t *pData, size_t length)
-{
-    Serial.print("");
-    for (int i = 0; i < length; i++)
-    {
-        char recChar = (char)pData[i];
+static void printFriendlyResponse(const uint8_t *pData, size_t length) {
+    log_d("");
+    for (int i = 0; i < length; i++) {
+        char recChar = static_cast<char>(pData[i]);
         if (recChar == '\f')
-            Serial.print(F("\\f"));
+            log_d("\\f");
         else if (recChar == '\n')
-            Serial.print(F("\\n"));
+            log_d("\\n");
         else if (recChar == '\r')
-            Serial.print(F("\\r"));
+            log_d("\\r");
         else if (recChar == '\t')
-            Serial.print(F("\\t"));
+            log_d("\\t");
         else if (recChar == '\v')
-            Serial.print(F("\\v"));
-        // convert spaces to underscore, easier to see in debug output
+            log_d("\\v");
         else if (recChar == ' ')
-            Serial.print(F("_"));
-        // display regular printable
+            // convert spaces to underscore, easier to see in debug output
+            log_d("_");
         else
-            Serial.print(recChar);
+            // display regular printable
+            log_d("%c", recChar);
     }
-    Serial.println("");
+    log_d("");
 }
 
-static void notifyCallback(
-    BLERemoteCharacteristic *pBLERemoteCharacteristic,
-    uint8_t *pData,
-    size_t length,
-    bool isNotify)
-{   Serial.print("[DEBUG] ELM RESPONSE > ");
-    printFriendlyResponse(pData, length);
-    staticBuffer = staticBuffer + std::string((char *)pData);
-}
+class AdvertisedDeviceCallbacks final : public BLEAdvertisedDeviceCallbacks {
+    BLEUUID serviceUUID;
+    BLEAdvertisedDeviceCb callback = nullptr;
 
-class MyClientCallback : public BLEClientCallbacks
-{
-
-    void onConnect(BLEClient *pclient)
-    {
-        connected = true;
+public:
+    AdvertisedDeviceCallbacks(const BLEUUID &serviceFilter) {
+        serviceUUID = serviceFilter;
     }
 
-    void onDisconnect(BLEClient *pclient)
-    {
-        connected = false;
+    explicit AdvertisedDeviceCallbacks(const BLEUUID &serviceFilter, const BLEAdvertisedDeviceCb &cb) {
+        serviceUUID = serviceFilter;
+        callback = cb;
     }
-};
 
-class MySecurity : public BLESecurityCallbacks
-{
-
-    uint32_t onPassKeyRequest()
-    {
-        return 123456;
-    }
-    void onPassKeyNotify(uint32_t pass_key)
-    {
-        Serial.printf("The passkey Notify number: %d", pass_key);
-    }
-    bool onConfirmPIN(uint32_t pass_key)
-    {
-        Serial.printf("The passkey YES/NO number: %d", pass_key);
-        vTaskDelay(5000);
-        return true;
-    }
-    bool onSecurityRequest()
-    {
-        Serial.printf("Security Request");
-        return true;
-    }
-    void onAuthenticationComplete(esp_ble_auth_cmpl_t auth_cmpl)
-    {
-        if (auth_cmpl.success)
-        {
-            Serial.printf("remote BD_ADDR: ");
-            Serial.printf("address type = %d ", auth_cmpl.addr_type);
-        }
-        Serial.printf("pair status = %s ", auth_cmpl.success ? "success" : "fail");
-    }
-};
-
-class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
-{
     /**
      * Called for each advertising BLE server.
      */
-    void onResult(BLEAdvertisedDevice advertisedDevice)
-    {
-        if (advertisedDevice.getName().c_str() == targetDeviceName)
-        {
-            Serial.print(targetDeviceName.c_str());
-            Serial.println(" found.");
-            BLEDevice::getScan()->stop();
-            myDevice = new BLEAdvertisedDevice(advertisedDevice);
-            doConnect = true;
-            doScan = true;
+    void onResult(BLEAdvertisedDevice advertisedDevice) override {
+        // filter for required service
+        if (advertisedDevice.getServiceUUID().equals(serviceUUID) &&
+            scanResults.add(advertisedDevice) && callback) {
+            callback(&advertisedDevice);
+        }
+    }
+};
+
+class ClientCallbacks final : public BLEClientCallbacks {
+    BLEConnectCb cCb;
+    BLEDisconnectCb disCb;
+
+public:
+    ClientCallbacks();
+
+    ClientCallbacks(const BLEConnectCb &connectCb, const BLEDisconnectCb &disconnectCb) {
+        cCb = connectCb;
+        disCb = disconnectCb;
+    }
+
+    void onConnect(BLEClient *pClient) override {
+        if (cCb != nullptr) {
+            cCb();
+        }
+    }
+
+    void onDisconnect(BLEClient *pClient) override {
+        if (disCb != nullptr) {
+            disCb();
         }
     }
 };
 
 // Constructor
-
-BLEClientSerial::BLEClientSerial()
-{
-    // nothing
-}
+BLEClientSerial::BLEClientSerial() = default;
 
 // Destructor
+BLEClientSerial::~BLEClientSerial() = default;
 
-BLEClientSerial::~BLEClientSerial(void)
-{
-    // clean up
+BLEClientSerial::operator bool() const {
+    return true;
+}
+
+void BLEClientSerial::notifyCallback(BLERemoteCharacteristic *pBLERemoteCharacteristic, uint8_t *pData, size_t length,
+                                     bool isNotify) {
+    if (pDataCb) {
+        pDataCb(pBLERemoteCharacteristic, pData, length);
+    }
+
+    log_d("ELM RESPONSE > ");
+    printFriendlyResponse(pData, length);
+
+    std::string receivedData(reinterpret_cast<char *>(pData), length);
+
+    if (buffer.size() < length || buffer.substr(buffer.size() - length) != receivedData) {
+        buffer += receivedData;
+    }
+
+    log_v("buffer after append: ");
+    log_v("%s", buffer.c_str());
 }
 
 // Begin bluetooth serial
-
-bool BLEClientSerial::begin(char *localName)
-{
-    targetDeviceName = localName;
-    BLEDevice::init("");
-    BLEScan* pBLEScan = BLEDevice::getScan();
-    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-    pBLEScan->setInterval(1349);
-    pBLEScan->setWindow(449);
-    pBLEScan->setActiveScan(true);
-    pBLEScan->start(5, false);
+bool BLEClientSerial::begin(const String &localName, const std::string &serviceUUID, const std::string &rxUUID,
+                            const std::string &txUUID) {
+    local_name = localName;
+    this->serviceUUID = BLEUUID(serviceUUID);
+    this->rxUUID = BLEUUID(rxUUID);
+    this->txUUID = BLEUUID(txUUID);
+    BLEDevice::init(local_name.c_str());
     return true;
 }
 
-int BLEClientSerial::available(void)
-{
+int BLEClientSerial::available() {
     // reply with data available
-    return staticBuffer.length();
+    return static_cast<int>(buffer.length());
 }
 
-int BLEClientSerial::peek(void)
-{
+int BLEClientSerial::peek() {
     // return first character available
     // but don't remove it from the buffer
-    if ((staticBuffer.length() > 0))
-    {
-        uint8_t c = staticBuffer[0];
+    if ((!buffer.empty())) {
+        uint8_t c = buffer[0];
         return c;
     }
-    else
-        return -1;
+
+    return -1;
 }
 
-bool BLEClientSerial::connect(void)
-{
-    Serial.println("Forming a connection to ");
-    Serial.println(myDevice->getAddress().toString().c_str());
-
-    BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
-    BLEDevice::setSecurityCallbacks(new MySecurity());
-
-    BLESecurity *pSecurity = new BLESecurity();
+bool BLEClientSerial::setPin(int pin) {
+    auto *pSecurity = new BLESecurity();
     pSecurity->setKeySize();
-    pSecurity->setStaticPIN(123456);
+    pSecurity->setStaticPIN(pin);
     pSecurity->setAuthenticationMode(ESP_LE_AUTH_BOND);
     pSecurity->setCapability(ESP_IO_CAP_NONE);
-
-    BLEClient *pClient = BLEDevice::createClient();
-    pClient->setClientCallbacks(new MyClientCallback());
-
-    pClient->connect(myDevice);
-
-    std::map<std::string, BLERemoteService *> *pRemoteServices = pClient->getServices();
-    if (pRemoteServices == nullptr)
-    {
-        Serial.println(" - No services");
-    }
-
-    BLERemoteService *pService = pClient->getService(serviceUUID_FFF0);
-    if (pService)
-    {
-        Serial.println("[DEBUG] Service FFF0 found.");
-
-        pRxCharacteristic = pService->getCharacteristic(rxUUID);
-        Serial.println("[DEBUG] CHAR rxUUID found.");
-        Serial.print("[DEBUG] canNotify ");
-        Serial.println(pRxCharacteristic->canNotify());
-
-        pTxCharacteristic = pService->getCharacteristic(txUUID);
-        Serial.println("[DEBUG] CHAR txUUID found.");
-        Serial.print("[DEBUG] canWrite ");
-        Serial.println(pTxCharacteristic->canWrite());
-
-        // Check and setup Rx notification
-        if (pRxCharacteristic->canNotify())
-        {
-            Serial.println("[DEBUG] RX subscribed");
-            pRxCharacteristic->registerForNotify(notifyCallback, true);
-        }
-    }
     return true;
 }
 
-int BLEClientSerial::read(void)
-{   
-    // read a character
-    if ((staticBuffer.length() > 0))
-    {
-        uint8_t c = staticBuffer[0];
-        staticBuffer.erase(0, 1); // remove it from the buffer
-        return c;
-    }
-    else
-        return -1;
+void BLEClientSerial::registerSecurityCallbacks(BLESecurityCallbacks *cb) {
+    BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
+    BLEDevice::setSecurityCallbacks(cb);
 }
 
-size_t BLEClientSerial::write(uint8_t c)
-{
+bool BLEClientSerial::connect(const String &remoteName) {
+    BLEAdvertisedDevice *device = nullptr;
+    BLEScanResultsSet *bleDeviceList = discover();
+
+    if (bleDeviceList != nullptr && bleDeviceList->getCount() > 0) {
+        for (int i = 0; i < bleDeviceList->getCount(); i++) {
+            BLEAdvertisedDevice *dev = bleDeviceList->getDevice(i);
+            if (strcmp(dev->getName().c_str(), remoteName.c_str()) == 0) {
+                device = dev;
+            }
+        }
+    } else {
+        return false;
+    }
+
+    if (device == nullptr) {
+        return false;
+    }
+
+    disconnect();
+
+    pClient = BLEDevice::createClient();
+    pClient->setClientCallbacks(new ClientCallbacks(pConnectCb, pDisconnectCb));
+    if (pClient->connect(device)) {
+        const std::map<std::string, BLERemoteService *> *pRemoteServices = pClient->getServices();
+        if (pRemoteServices == nullptr) {
+            log_e("No services");
+            return false;
+        }
+
+        BLERemoteService *pService = pClient->getService(serviceUUID);
+        if (pService) {
+            pRxCharacteristic = pService->getCharacteristic(rxUUID);
+            pTxCharacteristic = pService->getCharacteristic(txUUID);
+
+            // Check and setup Rx notification
+            if (pRxCharacteristic->canNotify()) {
+                pRxCharacteristic->registerForNotify([&](
+                                                 BLERemoteCharacteristic *pBLERemoteCharacteristic,
+                                                 uint8_t *pData,
+                                                 size_t length,
+                                                 bool isNotify) {
+                                                         notifyCallback(pBLERemoteCharacteristic, pData, length,
+                                                                        isNotify);
+                                                     }, true);
+            }
+
+            return true;
+        }
+
+        log_e("can find service %s", serviceUUID_FFF0.toString());
+    }
+
+    return false;
+}
+
+bool BLEClientSerial::connect(uint8_t remoteAddress[]) {
+    const BLEAddress addr = BLEAddress(remoteAddress);
+
+    disconnect();
+
+    pClient = BLEDevice::createClient();
+    pClient->setClientCallbacks(new ClientCallbacks(pConnectCb, pDisconnectCb));
+
+    if (pClient->connect(addr)) {
+        const std::map<std::string, BLERemoteService *> *pRemoteServices = pClient->getServices();
+        if (pRemoteServices == nullptr) {
+            log_e("No services");
+            return false;
+        }
+
+        BLERemoteService *pService = pClient->getService(serviceUUID);
+        if (pService) {
+            pRxCharacteristic = pService->getCharacteristic(rxUUID);
+            pTxCharacteristic = pService->getCharacteristic(txUUID);
+
+            // Check and setup Rx notification
+            if (pRxCharacteristic->canNotify()) {
+                pRxCharacteristic->registerForNotify([&](
+                                                 BLERemoteCharacteristic *pBLERemoteCharacteristic,
+                                                 uint8_t *pData,
+                                                 size_t length,
+                                                 bool isNotify) {
+                                                         notifyCallback(pBLERemoteCharacteristic, pData, length,
+                                                                        isNotify);
+                                                     }, true);
+            }
+
+            return true;
+        }
+
+        log_e("can find service %s", serviceUUID_FFF0.toString());
+    }
+
+    return false;
+}
+
+bool BLEClientSerial::connected() const {
+    return pClient != nullptr && pClient->isConnected();
+}
+
+bool BLEClientSerial::disconnect() {
+    if (pClient != nullptr) {
+        if (pClient->isConnected()) {
+            pClient->disconnect();
+        }
+        pClient = nullptr;
+        return true;
+    }
+
+    return false;
+}
+
+bool BLEClientSerial::isClosed() const {
+    return pClient == nullptr || !pClient->isConnected();
+}
+
+int BLEClientSerial::read(void) {
+    // read a character
+    if (!buffer.empty()) {
+        uint8_t c = buffer[0];
+        buffer.erase(0, 1); // remove it from the buffer
+        return c;
+    }
+    return -1;
+}
+
+size_t BLEClientSerial::write(uint8_t c) {
     pTxCharacteristic->writeValue(c, true);
-    delay(10); 
+    delay(10);
     return 1;
 }
 
-size_t BLEClientSerial::write(const uint8_t *buffer, size_t size)
-{   
-    for (int i = 0; i < size; i++)
-    {
-        pTxCharacteristic->writeValue(buffer[i],false);
+size_t BLEClientSerial::write(const uint8_t *buffer, size_t size) {
+    for (int i = 0; i < size; i++) {
+        pTxCharacteristic->writeValue(buffer[i], false);
     }
     return size;
 }
 
-void BLEClientSerial::flush()
-{
-    staticBuffer.clear();
+void BLEClientSerial::flush() {
+    buffer.clear();
 }
 
-void BLEClientSerial::end()
-{
-    // close connection
+void BLEClientSerial::end() {
+    disconnect();
+}
+
+void BLEClientSerial::onData(const BLESerialDataCb &cb) {
+    pDataCb = cb;
+}
+
+void BLEClientSerial::onConnect(const BLEConnectCb &cb) {
+    pConnectCb = cb;
+}
+
+void BLEClientSerial::onDisconnect(const BLEDisconnectCb &cb) {
+    pDisconnectCb = cb;
+}
+
+BLEScanResultsSet *BLEClientSerial::discover(int timeout) {
+    BLEScanResultsSet *bleDeviceList = getScanResults();
+
+    if (discoverAsync([](BLEAdvertisedDevice *pDevice) {
+        log_d("found %s - %s %d\n", pDevice->getAddress().toString().c_str(), pDevice->getName().c_str(),
+              pDevice->getRSSI());
+    }, timeout)) {
+        delay(timeout);
+        discoverAsyncStop();
+
+        if (bleDeviceList->getCount() > 0) {
+            return bleDeviceList;
+        }
+    }
+
+    return nullptr;
+}
+
+bool BLEClientSerial::discoverAsync(const BLEAdvertisedDeviceCb &cb, int timeout) {
+    disconnect();
+    discoverClear();
+
+    BLEScan *pBLEScan = BLEDevice::getScan();
+
+    if (pBLEScan != nullptr) {
+        pBLEScan->stop();
+
+
+        pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(serviceUUID, cb));
+        pBLEScan->setInterval(INQ_TIME);
+        pBLEScan->setWindow(449);
+        pBLEScan->setActiveScan(true);
+        pBLEScan->start(timeout / 1000, false);
+
+        return true;
+    }
+
+    return false;
+}
+
+void BLEClientSerial::discoverAsyncStop() {
+    if (BLEDevice::getScan() != nullptr) {
+        BLEDevice::getScan()->stop();
+        BLEDevice::getScan()->setActiveScan(false);
+    }
+}
+
+void BLEClientSerial::discoverClear() {
+    scanResults.clear();
+}
+
+BLEScanResultsSet *BLEClientSerial::getScanResults() {
+    return &scanResults;
 }
