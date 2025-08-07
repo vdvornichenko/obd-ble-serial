@@ -38,14 +38,23 @@ static void printFriendlyResponse(uint8_t *pData, size_t length)
     Serial.println("");
 }
 
+
 static void notifyCallback(
     BLERemoteCharacteristic *pBLERemoteCharacteristic,
     uint8_t *pData,
     size_t length,
     bool isNotify)
-{   Serial.print("[DEBUG] ELM RESPONSE > ");
+{   
+    Serial.print("[DEBUG] ELM RESPONSE > ");
     printFriendlyResponse(pData, length);
-    staticBuffer = staticBuffer + std::string((char *)pData);
+
+    // Convert the received data into a string
+    std::string receivedData((char*)pData, length);
+
+    // If the new string is already present at the end of staticBuffer, we avoid concatenating it
+    if (staticBuffer.size() < length || staticBuffer.substr(staticBuffer.size() - length) != receivedData) {
+        staticBuffer += receivedData;
+    }
 }
 
 class MyClientCallback : public BLEClientCallbacks
@@ -165,6 +174,11 @@ int BLEClientSerial::peek(void)
 bool BLEClientSerial::connect(void)
 {
     Serial.println("Forming a connection to ");
+    Serial.println("Forming a connection to ");
+    if (myDevice == nullptr) {
+        Serial.println("Error: No BLE device found! Make sure OBD is turned on.");
+        return false;
+    }
     Serial.println(myDevice->getAddress().toString().c_str());
 
     BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
